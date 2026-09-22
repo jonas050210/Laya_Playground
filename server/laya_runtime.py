@@ -24,8 +24,8 @@ Peak RSS with this path: ~1.30 GB, load time ~5 s.
 from __future__ import annotations
 
 import json
-import math
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -50,9 +50,54 @@ REPO = "convaiinnovations/laya"
 SUBFOLDER = "multilingual"
 EMB_KEY = "encoder.embeddings.tok_embeddings.weight"
 
-_TORCH_THREADS = int(os.environ.get("LAYA_THREADS", "2"))
+_TORCH_THREADS = int(os.environ.get("LAYA_THREADS", str(min(8, os.cpu_count() or 2))))
 torch.set_num_threads(_TORCH_THREADS)
 torch.set_grad_enabled(False)
+
+
+def _select_device() -> torch.device:
+    """Pick the runtime device.
+
+    The launcher installs a CUDA-capable torch build when requested, but the runtime still
+    has to put both model weights and input tensors on CUDA. Default to GPU when one is
+    genuinely available; keep ``LAYA_DEVICE=cpu`` as an escape hatch for low-VRAM boxes or
+    reproducibility runs.
+    """
+    requested = os.environ.get("LAYA_DEVICE", "auto").strip().lower()
+    if requested not in {"auto", "cpu", "cuda"}:
+        requested = "auto"
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("LAYA_DEVICE=cuda was requested, but torch.cuda is not available")
+        return torch.device("cuda")
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+
+def _batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    if device.type == "cpu":
+        return batch
+    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+
+def _sync_device(device: torch.device) -> None:
+    """Make latency measurements honest on CUDA, where kernels are asynchronous."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def cuda_info(device: torch.device) -> Optional[Dict[str, Any]]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(idx)
+    return {
+        "name": props.name,
+        "total_vram_mb": round(props.total_memory / (1024 ** 2), 1),
+        "allocated_mb": round(torch.cuda.memory_allocated(idx) / (1024 ** 2), 1),
+        "reserved_mb": round(torch.cuda.memory_reserved(idx) / (1024 ** 2), 1),
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -95,7 +140,7 @@ def entropy_bits(p: np.ndarray) -> float:
 # loader
 # --------------------------------------------------------------------------------------
 
-def _materialize_rope(model: torch.nn.Module) -> List[Dict[str, Any]]:
+def _materialize_rope(model: torch.nn.Module, device: torch.device) -> List[Dict[str, Any]]:
     """Recompute non-persistent rope buffers left on the meta device.
 
     Raises on any *other* meta buffer rather than zero-filling it, because a silently
@@ -120,7 +165,7 @@ def _materialize_rope(model: torch.nn.Module) -> List[Dict[str, Any]]:
             inv = 1.0 / (
                 theta ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float() / head_dim)
             )
-            mod.register_buffer(buf_name, inv, persistent=False)
+            mod.register_buffer(buf_name, inv.to(device), persistent=False)
             fixed.append({"buffer": f"{mod_name}.{buf_name}", "theta": theta})
     return fixed
 
@@ -189,6 +234,7 @@ class LayaRuntime:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._load_lock = threading.Lock()
+        self.device = _select_device()
         self.model = None
         self.tok = None
         self.cfg: Dict[str, Any] = {}
@@ -212,7 +258,7 @@ class LayaRuntime:
             t0 = time.perf_counter()
             try:
                 snap = resolve_snapshot()
-                self.status.detail = "building graph on meta device"
+                self.status.detail = f"building graph on meta device ({self.device.type} runtime)"
 
                 from safetensors import safe_open
                 from transformers import AutoTokenizer
@@ -231,16 +277,15 @@ class LayaRuntime:
                         # The 256k-row vocab table is 61% of the file. Keeping it fp16 and
                         # up-casting the looked-up rows saves ~390 MB with no effect on the
                         # matmuls, which all run in fp32.
-                        state_dict[key] = (
-                            tensor.to(torch.float16) if key == EMB_KEY else tensor.to(torch.float32)
-                        )
+                        dtype = torch.float16 if key == EMB_KEY else torch.float32
+                        state_dict[key] = tensor.to(device=self.device, dtype=dtype)
                         del tensor
 
                 model.load_state_dict(state_dict, strict=True, assign=True)
                 del state_dict
                 model.eval()
 
-                self.status.rope_fixed = _materialize_rope(model)
+                self.status.rope_fixed = _materialize_rope(model, self.device)
                 try:
                     model.encoder.config.reference_compile = False
                 except Exception:
@@ -263,6 +308,10 @@ class LayaRuntime:
                 self.status.peak_rss_mb = peak_rss_mb()
 
                 self.predict("warm up", {"w": noul("Is this a warm up call?")})
+                self.total_calls = 0
+                self.total_questions = 0
+                self.total_input_tokens = 0
+                self.total_infer_ms = 0.0
             except Exception as exc:  # pragma: no cover
                 self.status.state = "failed"
                 self.status.detail = f"{type(exc).__name__}: {exc}"
@@ -290,9 +339,10 @@ class LayaRuntime:
                 )
             items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]})
 
-        batch = collate_items([items], self.tok.pad_token_id)
+        batch = _batch_to_device(collate_items([items], self.tok.pad_token_id), self.device)
 
         with self._lock:
+            _sync_device(self.device)
             t0 = time.perf_counter()
             with torch.inference_mode():
                 logits, act = self.model(
@@ -302,10 +352,11 @@ class LayaRuntime:
                     batch["marker_mask"],
                     batch["qtype"],
                 )
+            _sync_device(self.device)
             infer_ms = (time.perf_counter() - t0) * 1000.0
 
-        logits_np = logits.float().numpy()
-        act_np = torch.softmax(act.float(), -1).numpy()
+        logits_np = logits.float().cpu().numpy()
+        act_np = torch.softmax(act.float(), -1).cpu().numpy()
         n_tokens = int(batch["attention_mask"].sum())
 
         answers: Dict[str, Dict[str, Any]] = {}
@@ -383,7 +434,10 @@ class LayaRuntime:
                 q = _internal(qdef)
                 seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len)
                 if len(markers) != len(render_options(q)):
-                    continue
+                    raise ValueError(
+                        f"pair {pair_i} question {qid!r}: options do not fit in "
+                        f"head_max_len={head_max_len}"
+                    )
                 rows.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]})
                 index.append((pair_i, qid, q, len(markers)))
 
@@ -406,16 +460,18 @@ class LayaRuntime:
         total_tokens = 0
         logits_all = []
         for chunk in chunks:
-            batch = collate_items([chunk], self.tok.pad_token_id)
+            batch = _batch_to_device(collate_items([chunk], self.tok.pad_token_id), self.device)
             with self._lock:
+                _sync_device(self.device)
                 t0 = time.perf_counter()
                 with torch.inference_mode():
                     logits, _ = self.model(
                         batch["input_ids"], batch["attention_mask"],
                         batch["marker_pos"], batch["marker_mask"], batch["qtype"])
+                _sync_device(self.device)
                 total_ms += (time.perf_counter() - t0) * 1000.0
             total_tokens += int(batch["attention_mask"].sum())
-            logits_all.append(logits.float().numpy())
+            logits_all.append(logits.float().cpu().numpy())
 
         flat = np.concatenate([np.pad(l, ((0, 0), (0, max(0, max(x.shape[1] for x in logits_all) - l.shape[1]))),
                                       constant_values=-1e4) for l in logits_all], axis=0)
@@ -476,6 +532,8 @@ class LayaRuntime:
             "context": self.cfg.get("max_len", 1024),
             "head_max_len": self.cfg.get("head_max_len", 256),
             "precision": "fp32 compute · fp16 vocab table",
+            "device": str(self.device),
+            "cuda": cuda_info(self.device),
             "threads": _TORCH_THREADS,
             "load_seconds": round(self.status.load_seconds, 2),
             "peak_rss_mb": round(peak_rss_mb(), 1),
@@ -492,9 +550,51 @@ class LayaRuntime:
 
 
 def peak_rss_mb() -> float:
-    import resource
+    """Best-effort process peak RSS in MiB, without adding a psutil dependency.
 
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    ``resource.ru_maxrss`` is KiB on Linux and bytes on macOS; Windows has no
+    ``resource`` module at all. Returning 0.0 is preferable to failing model startup on
+    platforms where only the memory display is unavailable.
+    """
+    try:
+        import resource
+
+        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return rss / (1024.0 * 1024.0) if sys.platform == "darwin" else rss / 1024.0
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(counters)
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                ctypes.windll.kernel32.GetCurrentProcess(),
+                ctypes.byref(counters),
+                counters.cb,
+            )
+            if ok:
+                return float(counters.PeakWorkingSetSize) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+    return 0.0
 
 
 RUNTIME = LayaRuntime()
