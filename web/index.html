@@ -337,7 +337,7 @@ async function poll(){
     $('#pModel').textContent = s.state==='ready' ? 'mmBERT-base 322M' : '—';
     $('#pCalls').textContent = s.totals?s.totals.calls:0;
     $('#footInfo').textContent =
-      `${s.repo} · ${s.precision} · ctx ${s.context} · loaded in ${s.load_seconds}s · peak RSS ${s.peak_rss_mb} MB · rope buffers restored ${s.rope_buffers_restored} · ${s.threads} threads`;
+      `${s.repo} · ${s.precision} · ${s.device||'cpu'} · ctx ${s.context} · loaded in ${s.load_seconds}s · peak RSS ${s.peak_rss_mb} MB · rope buffers restored ${s.rope_buffers_restored} · ${s.threads} threads`;
     if(s.state==='ready'&&VIEWS[cur]&&VIEWS[cur].onReady&&!VIEWS[cur]._ready){
       /* Guard: onReady fires from the status poll, which can land after the user has
          already switched away. Stamp it with the mount generation. */
@@ -418,6 +418,7 @@ VIEWS.about={icon:'◆',name:'Overview',render(){
   <p class="lede">Each one puts Laya in a loop where it has to decide, and shows every number behind
   the decision — probabilities, confidence, margin, entropy, and whether it was right.</p>
   <div class="tiles">
+    ${tile('bench','CEO Benchmark','Live benchmark mode: ranks the important panels by speed, accuracy, value and demo usefulness.','quick/full suite · CEO buckets')}
     ${tile('snake','Snake','The upstream demo, rebuilt. Three questions per tick; a Hamiltonian-cycle shield catches fatal moves.','accuracy · interventions · ms/move')}
     ${tile('aim','Aim Trainer','Laya locates the target from described sectors, with decoys. The panel you asked for.','hit rate · reaction ms · per-sector heatmap')}
     ${tile('cascade','Aim Cascade','36 cells break a single question. One yes/no per region, argmax in code, cascaded for speed.','0.000 → 1.000 · 13 questions not 36')}
@@ -503,7 +504,7 @@ VIEWS.about={icon:'◆',name:'Overview',render(){
     <div class="stat"><div class="k">1 question</div><div class="v sm">~120 ms</div></div>
     <div class="stat"><div class="k">3 questions</div><div class="v sm">~260 ms</div></div>
     <div class="stat"><div class="k">drift vs SDK</div><div class="v sm ok">1.6e-08</div></div>
-    <div class="stat"><div class="k">checks passing</div><div class="v sm ok">31</div></div>
+    <div class="stat"><div class="k">checks passing</div><div class="v sm ok">68</div></div>
   </div>
   <div class="note bad"><b>The expensive bug.</b> Meta-device init leaves non-persistent buffers
   empty, and my first name match was too narrow — so the four RoPE tables were silently filled with
@@ -517,6 +518,75 @@ VIEWS.about={icon:'◆',name:'Overview',render(){
   probabilities by up to <b>0.49</b>. Rejected: this playground is about reading probabilities, so
   exact fp32 wins.</div>
 </div>`;}};
+
+/* ---------- CEO benchmark ---------- */
+VIEWS.bench={icon:'▣',name:'CEO Benchmark',render(){return `
+<div class="grid"><div>
+  <div class="card">
+    <h2>CEO Benchmark <span class="tag">live ranking mode</span></h2>
+    <p class="lede">Ein kurzer, reproduzierbarer Lauf über die wichtigsten Panels. Nicht als Paper-Eval gedacht,
+    sondern als CEO-Check: Welche Demos zeigen Laya wirklich gut, wie schnell sind sie, und was bleibt Showcase,
+    Failure-Lab oder Legacy.</p>
+    <div class="row">
+      <label class="fld">suite<select id="bSuite"><option value="quick" selected>quick</option><option value="full">full</option></select></label>
+      <label class="fld">seed<input type="number" id="bSeed" value="7"></label>
+      <label class="fld">shooter difficulty<select id="bDiff"><option>easy</option><option selected>normal</option><option>hard</option></select></label>
+      <label class="fld">shooter budget<select id="bBudget"><option value="">no limit</option><option value="460">460 ms</option><option value="1150">1150 ms</option></select></label>
+      <button class="act" id="bRun">Run benchmark</button>
+    </div>
+    <div class="note ok"><b>Decision:</b> Snake bleibt drin. Es ist kein starker Accuracy-Beweis, aber sehr gut, um
+    wiederholte Decisions und Speed sichtbar zu machen.</div>
+    <div id="bOut"><p class="lede">Run benchmark starten.</p></div>
+  </div>
+</div><div>
+  <div class="card">
+    <h2>CEO ranking</h2>
+    <table><thead><tr><th>bucket</th><th>panels</th><th>warum</th></tr></thead><tbody>
+      <tr class="hit"><td><b>Showcase</b></td><td>Shooter, Aim Cascade</td><td>echte Game-Entscheidungen + klare Messwerte</td></tr>
+      <tr class="hit"><td><b>Product proof</b></td><td>Triage, Guardrail, RAG, Calibration</td><td>zeigt wofür Laya wirklich gebaut ist</td></tr>
+      <tr><td><b>Speed loop</b></td><td>Snake</td><td>viele kleine Decisions im sichtbaren Spiel</td></tr>
+      <tr><td><b>Failure / Legacy</b></td><td>Mines, Maze, Basic Aim, Trading</td><td>bleiben nützlich, aber nicht als Hauptbeweis</td></tr>
+    </tbody></table>
+  </div>
+  <div class="card">
+    <h2>Wie ich Laya hier einsetze</h2>
+    <div class="note">Code berechnet Welt, Regeln und Ground Truth. Laya bekommt nur beschriebene Einzelentscheidungen.
+    Python nimmt danach den Argmax, setzt Budgets, Kaskaden und Safety-Shields.</div>
+    <div class="note warn">Keine großen Listen in eine Frage quetschen. Besser: ein Objekt pro State, kleine
+    yes/no- oder 2-way-choice-Fragen, Vergleich in Code.</div>
+  </div>
+</div></div>`;},
+ mount(){
+  const run=async()=>{
+    const out=$('#bOut');
+    $('#bRun').disabled=true;
+    out.innerHTML='<h2>Benchmark läuft…</h2><div class="skel" style="width:70%"></div><div class="skel" style="width:45%"></div><div class="note warn">Quick läuft einige echte Modellcalls. Full dauert deutlich länger.</div>';
+    const budget=$('#bBudget').value;
+    try{
+      const d=await api('/api/benchmark/run',{
+        suite:$('#bSuite').value,
+        seed:+$('#bSeed').value,
+        shooter_difficulty:$('#bDiff').value,
+        shooter_budget_ms:budget?+budget:null
+      });
+      setLat(d.wall_ms);
+      out.innerHTML=`<h2>Result <span class="tag">${d.suite} · seed ${d.seed} · ${Math.round(d.wall_ms)} ms wall</span></h2>
+        <div class="action ok"><div class="ico">✓</div><div><div style="font-size:9.5px;letter-spacing:1px;color:var(--dim);text-transform:uppercase;font-weight:650">CEO decision</div>
+        <div class="txt">${esc(d.ceo_decision.headline)}</div></div></div>
+        <div class="tbl"><table><thead><tr><th>panel</th><th>tier</th><th>score</th><th>baseline</th><th class="num">acc</th><th class="num">value</th><th class="num">avg ms</th><th class="num">q</th><th>note</th></tr></thead><tbody>`+
+        d.rows.map(r=>`<tr class="${r.tier.includes('showcase')||r.tier.includes('product')?'hit':''}">
+          <td><b>${esc(r.panel)}</b></td><td><span class="badge2 ${r.tier.includes('showcase')?'ok':r.tier.includes('speed')?'acc':''}">${esc(r.tier)}</span></td>
+          <td>${esc(r.score)}</td><td class="dimc">${esc(r.baseline||'—')}</td><td class="num ${r.accuracy_pct>=80?'ok':r.accuracy_pct!=null?'warn':'dimc'}">${r.accuracy_pct!=null?r.accuracy_pct.toFixed(1)+'%':'—'}</td>
+          <td class="num ${r.value_pct>=70?'ok':r.value_pct!=null?'warn':'dimc'}">${r.value_pct!=null?r.value_pct.toFixed(1)+'%':'—'}</td>
+          <td class="num">${r.avg_ms!=null?Math.round(r.avg_ms):'—'}</td><td class="num">${r.questions}</td>
+          <td class="wrap">${esc(r.note)}</td></tr>`).join('')+`</tbody></table></div>`+
+        (d.errors&&d.errors.length?`<div class="note bad"><b>Errors:</b> ${d.errors.map(e=>`${esc(e.panel)}: ${esc(e.error)}`).join(' · ')}</div>`:'')+
+        `<div class="note">${esc(d.ceo_decision.reason)}</div>`;
+    }catch(e){out.innerHTML=`<div class="note bad">${esc(e.message)}</div>`;}
+    $('#bRun').disabled=false;
+  };
+  $('#bRun').onclick=run;
+ }};
 
 /* ---------- 1. snake ---------- */
 VIEWS.snake={icon:'▦',name:'Snake',auto:null,render(){return `
@@ -1067,6 +1137,16 @@ VIEWS.free={icon:'⌘',name:'Free Playground',render(){return `
  mount(){
   const _g=MOUNT; const outEl=()=>$g('#fOut',_g);
   const EX={
+   ex1:{s:{
+        from:"user@acme.com",
+        subject:"Duplicate charge on invoice #4411",
+        body:"Hi, we were billed twice for March. Refund the duplicate today or we will cancel our plan."
+      },
+      q:{department:{type:"choice",instructions:"Which department should handle this request?",
+        criteria:{billing:"invoices, payments, refunds",technical:"bugs, outages, system errors",sales:"pricing, new contracts",other:"everything else"}},
+        urgency:{type:"score",instructions:"How urgent is this request?",
+        criteria:["not urgent","soon","critical deadline or blocking issue"]},
+        churn_risk:{type:"noul",instructions:"Does the user threaten to cancel or leave?"}}},
    ex2:{s:"मुझसे दो बार शुल्क लिया गया, कृपया पैसे वापस करें। यह तीसरी बार है।",
      q:{department:{type:"choice",instructions:"Which department should handle this request?",
         criteria:{billing:"invoices, payments, refunds",technical:"bugs, outages",sales:"pricing",other:"everything else"}},
@@ -1104,7 +1184,8 @@ VIEWS.free={icon:'⌘',name:'Free Playground',render(){return `
     }catch(e){outEl().innerHTML=`<div class="note bad">${esc(e.message)}</div>`;}
   };
   $g('#fRun',_g).onclick=run;
-  $g('#fEx1',_g).onclick=()=>location.reload();
+  $g('#fEx1',_g).onclick=()=>{$g('#fState',_g).value=JSON.stringify(EX.ex1.s,null,2);
+    $g('#fQ',_g).value=JSON.stringify(EX.ex1.q,null,2);run();};
   $g('#fEx2',_g).onclick=()=>{$g('#fState',_g).value=EX.ex2.s;
     $g('#fQ',_g).value=JSON.stringify(EX.ex2.q,null,2);run();};
   $g('#fEx3',_g).onclick=()=>{$g('#fState',_g).value=EX.ex3.s;
@@ -2161,7 +2242,7 @@ VIEWS.cascade={icon:'⊞',name:'Aim Cascade',group:'games',timer:null,
 
 /* ---------- router ---------- */
 const GROUPS=[
-  {label:'', keys:['about']},
+  {label:'', keys:['about','bench']},
   {label:'games', keys:['snake','aim','cascade','shooter','maze','mines','guard','triage','calib']},
   {label:'official demo', keys:['wtriage','wemail','wguard','wrag','wmod','wrouter','wlang']},
   {label:'markets', keys:['market']},

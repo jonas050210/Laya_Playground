@@ -18,7 +18,6 @@ Run:  python3 tools/verify_runtime.py
 from __future__ import annotations
 
 import copy
-import json
 import os
 import sys
 import time
@@ -82,7 +81,7 @@ def test_no_meta() -> None:
     check("buffers materialised", not meta_b, f"{len(meta_b)} on meta")
     emb = model.encoder.embeddings.tok_embeddings
     check("vocab table kept in fp16", emb.weight.dtype == torch.float16, str(emb.weight.dtype))
-    out = emb(torch.tensor([[1, 2, 3]]))
+    out = emb(torch.tensor([[1, 2, 3]], device=emb.weight.device))
     check("embedding output up-cast to fp32", out.dtype == torch.float32, str(out.dtype))
     others = [p.dtype for n, p in model.named_parameters() if "tok_embeddings" not in n]
     check("all other parameters fp32", all(d == torch.float32 for d in others),
@@ -124,10 +123,11 @@ def test_against_stock_sdk() -> None:
                                   RUNTIME.cfg["max_len"], RUNTIME.cfg["head_max_len"])
     batch = collate_items([[{"ids": seq, "markers": markers, "qtype": QTYPES["choice"]}]],
                           RUNTIME.tok.pad_token_id)
+    batch = {k: (v.to(RUNTIME.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
     with torch.inference_mode():
         logits, _ = RUNTIME.model(batch["input_ids"], batch["attention_mask"],
                                   batch["marker_pos"], batch["marker_mask"], batch["qtype"])
-    z = logits.float().numpy()[0, :len(markers)]
+    z = logits.float().cpu().numpy()[0, :len(markers)]
     ref = np.exp(z - z.max())
     ref = ref / ref.sum()
 

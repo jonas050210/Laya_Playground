@@ -30,9 +30,11 @@ default), downloads the 644 MB checkpoint with a progress bar, serves the UI on
 | `--host 127.0.0.1` | bind address (default `0.0.0.0`) |
 | `--no-install` | never touch pip; fail if a dependency is missing |
 | `--no-browser` | do not open a browser |
-| `--gpu` | install the CUDA build of torch instead of the CPU one |
+| `--gpu` | force/prefer the CUDA build of torch (NVIDIA GPUs are auto-detected on first run) |
+| `--device cpu\|cuda\|auto` | choose the runtime device (default `auto`; uses CUDA when available) |
+| `--profile` | load the model, measure local latency on your machine, print a plain text table and exit |
 | `--check` | report environment status and exit |
-| `--verify` | run the 54-check verification suite and exit |
+| `--verify` | run the 68-check verification suite and exit |
 
 **Requirements:** Python 3.9+, ~2 GB RAM, ~1.5 GB disk for the checkpoint. No GPU needed.
 
@@ -227,7 +229,7 @@ server/
   market.py                 the trading floor — price sim, features, portfolio, benchmarks
   workflows.py              the 7 ported demo workflows
 web/index.html              the whole UI, no build step, no CDN
-tools/verify_runtime.py     45 checks
+tools/verify_runtime.py     68 checks
 docs/upstream_*.py          vendored upstream sources for comparison
 RESEARCH.md                 the full deep dive
 ```

@@ -18,10 +18,11 @@ Pooled: **1/6**. Below chance, and the pick moved when only the option order cha
 position bias, not reasoning. This is the spatial-reasoning failure from RESEARCH.md §2
 showing up again: the model cannot hold a scene and compare its parts.
 
-Scoring each contact *independently* and letting code take the argmax fixes it completely:
-
-    per-contact `score` question, randomised squads ... **12/12 = 1.00**
-    every critical contact outranks every harmless one (2.158 vs 1.539 worst case)
+Scoring each contact independently is the right *shape*, but the question still matters.
+The obvious `score` question — "how urgent is this contact?" — looked good on an early
+hand-built set and then failed on held-out scenes because it mostly tracked distance.
+The shipped ranking uses two sharper two-way `choice` questions per contact:
+"is it attacking/about to attack?" plus a hostile/prop tie-breaker.
 
 Same rescue pattern as the RAG filter: one state per item, batched into a single pass,
 with the comparison done in Python. Laya judges one thing at a time; code decides.
@@ -31,7 +32,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from laya_runtime import RUNTIME
 

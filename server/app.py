@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import sys
 import threading
-import time
 from typing import Any, Dict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +25,7 @@ import games as G  # noqa: E402
 import workflows as W  # noqa: E402
 import market as M  # noqa: E402
 import shooter as S  # noqa: E402
+import benchmarks as B  # noqa: E402
 from laya_runtime import RUNTIME  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -83,6 +83,27 @@ def set_temperature(body: TempBody) -> Dict[str, Any]:
                            "score": max(0.05, body.score),
                            "noul": max(0.05, body.noul)}
     return {"temperature": RUNTIME.temperature}
+
+
+class BenchmarkBody(BaseModel):
+    suite: str = "quick"             # quick | full
+    seed: int = 7
+    shooter_difficulty: str = "normal"
+    shooter_budget_ms: Optional[float] = None
+
+
+@app.post("/api/benchmark/run")
+def benchmark_run(body: BenchmarkBody) -> Dict[str, Any]:
+    _require_ready()
+    try:
+        return B.run_benchmark(
+            suite=body.suite,
+            seed=body.seed,
+            shooter_difficulty=body.shooter_difficulty,
+            shooter_budget_ms=body.shooter_budget_ms,
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"{type(exc).__name__}: {exc}")
 
 
 # --------------------------------------------------------------------------------------

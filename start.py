@@ -11,7 +11,9 @@ Useful flags:
     --host 0.0.0.0     bind address
     --no-install       never touch pip; fail if a dependency is missing
     --no-browser       do not open a browser
-    --gpu              install the CUDA build of torch instead of the CPU one
+    --gpu              install/prefer the CUDA build of torch
+    --device auto      runtime device: auto, cpu or cuda
+    --profile          measure local Laya latency and exit
     --verify           run the verification suite and exit
     --check            report environment status and exit
 """
@@ -45,6 +47,9 @@ REQUIREMENTS = {
     "uvicorn": "uvicorn",
 }
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+# Stable CUDA wheel index. RTX 40xx cards support this easily; users can override for
+# newer PyTorch/CUDA stacks with TORCH_CUDA_INDEX if they want.
+TORCH_CUDA_INDEX = os.environ.get("TORCH_CUDA_INDEX", "https://download.pytorch.org/whl/cu121")
 
 C = {"d": "\033[2m", "b": "\033[1m", "g": "\033[32m", "y": "\033[33m",
      "r": "\033[31m", "c": "\033[36m", "x": "\033[0m"}
@@ -73,17 +78,63 @@ def missing_packages() -> list:
     return out
 
 
-def install(missing: list, gpu: bool) -> bool:
-    say(f"  Installing {len(missing)} missing package(s). First run only.", "y")
+def nvidia_gpu_name() -> str | None:
+    """Best-effort NVIDIA GPU detection without importing torch.
+
+    This lets a Windows gaming/workstation PC get the CUDA build on first run even when
+    torch is not installed yet. No NVIDIA tool/driver means we safely fall back to CPU.
+    """
+    candidates = []
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        candidates.append(smi)
+    if sys.platform == "win32":
+        candidates.append(r"C:\Windows\System32\nvidia-smi.exe")
+    for exe in candidates:
+        if not exe or not Path(exe).exists():
+            continue
+        try:
+            out = subprocess.check_output(
+                [exe, "--query-gpu=name", "--format=csv,noheader"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+            if out:
+                return out.splitlines()[0].strip()
+        except Exception:
+            pass
+    if sys.platform == "win32":
+        try:
+            out = subprocess.check_output(
+                ["wmic", "path", "win32_VideoController", "get", "name"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            for line in out.splitlines():
+                line = line.strip()
+                if "nvidia" in line.lower():
+                    return line
+        except Exception:
+            pass
+    return None
+
+
+def install(missing: list, gpu: bool, force_torch: bool = False) -> bool:
+    n = len(missing) + (1 if force_torch and not any(m == "torch" for m, _ in missing) else 0)
+    say(f"  Installing {n} package(s)." + ("" if force_torch else " First run only."), "y")
     say()
-    torch_missing = any(m == "torch" for m, _ in missing)
+    torch_missing = any(m == "torch" for m, _ in missing) or force_torch
     others = [req for mod, req in missing if mod != "torch"]
 
     if torch_missing:
-        cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir", "torch"]
-        if not gpu:
-            cmd += ["--index-url", TORCH_CPU_INDEX]
-        say(f"    torch ({'CUDA' if gpu else 'CPU-only, ~200 MB'}) …", "d")
+        cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir"]
+        if force_torch:
+            cmd.append("--force-reinstall")
+        cmd.append("torch")
+        cmd += ["--index-url", TORCH_CUDA_INDEX if gpu else TORCH_CPU_INDEX]
+        say(f"    torch ({'CUDA, NVIDIA GPU' if gpu else 'CPU-only, ~200 MB'}) …", "d")
         if subprocess.call(cmd, stdout=subprocess.DEVNULL) != 0:
             say("  ✗ torch failed to install", "r")
             return False
@@ -140,6 +191,10 @@ def report_environment() -> None:
         say(f"  memory    {free:.1f} GB available of {total:.1f} GB"
             + ("   ← tight; close other apps" if warn else ""), "y" if warn else "d")
     say(f"  cpus      {os.cpu_count()}", "d")
+    gpu_name = nvidia_gpu_name()
+    if gpu_name:
+        say(f"  gpu       {gpu_name}  (CUDA torch will be preferred)", "g")
+    say(f"  runtime   device={os.environ.get('LAYA_DEVICE', 'auto')} (auto uses CUDA if available)", "d")
 
     missing = missing_packages()
     if missing:
@@ -173,14 +228,19 @@ def report_environment() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Start the Laya Model Playground.")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7860)))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "7860")))
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--no-install", action="store_true", help="never invoke pip")
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser")
-    ap.add_argument("--gpu", action="store_true", help="install the CUDA torch build")
+    ap.add_argument("--gpu", action="store_true", help="force-install/prefer the CUDA torch build")
+    ap.add_argument("--device", choices=("auto", "cpu", "cuda"),
+                    default=os.environ.get("LAYA_DEVICE", "auto"),
+                    help="runtime device selection (default: auto)")
+    ap.add_argument("--profile", action="store_true", help="measure local Laya latency and exit")
     ap.add_argument("--verify", action="store_true", help="run the verification suite and exit")
     ap.add_argument("--check", action="store_true", help="report environment and exit")
     args = ap.parse_args()
+    os.environ["LAYA_DEVICE"] = args.device
 
     banner()
 
@@ -200,13 +260,36 @@ def main() -> int:
         return 0
 
     missing = missing_packages()
-    if missing:
+    gpu_name = nvidia_gpu_name()
+    prefer_gpu = bool(args.gpu or (args.device != "cpu" and gpu_name))
+    if prefer_gpu and not args.gpu and gpu_name:
+        say(f"  NVIDIA GPU detected ({gpu_name}); using the CUDA torch build automatically.", "g")
+    force_torch = False
+    if prefer_gpu and importlib.util.find_spec("torch") is not None:
+        try:
+            import torch
+            force_torch = getattr(torch.version, "cuda", None) is None
+            if force_torch:
+                say("  CUDA-capable GPU found but installed torch is CPU-only; reinstalling torch.", "y")
+        except Exception:
+            pass
+    if missing or force_torch:
         if args.no_install:
-            say(f"  ✗ missing: {', '.join(r for _, r in missing)}", "r")
+            if missing:
+                say(f"  ✗ missing: {', '.join(r for _, r in missing)}", "r")
+            if force_torch:
+                say("  ✗ CUDA-capable GPU found, but installed torch is CPU-only", "r")
             say("    Install them, or drop --no-install.", "d")
             return 1
-        if not install(missing, args.gpu):
+        if not install(missing, prefer_gpu, force_torch=force_torch):
             return 1
+        if force_torch:
+            if os.environ.get("LAYA_TORCH_RESTARTED"):
+                say("  ! torch was reinstalled but this process already restarted once; continuing.", "y")
+            else:
+                say("  Restarting Python so the freshly installed CUDA torch is imported…", "y")
+                os.environ["LAYA_TORCH_RESTARTED"] = "1"
+                os.execv(sys.executable, [sys.executable, *sys.argv])
         say()
 
     if not fetch_checkpoint():
@@ -221,6 +304,11 @@ def main() -> int:
         say("  Running verification suite …", "c")
         say()
         return subprocess.call([sys.executable, str(HERE / "tools" / "verify_runtime.py")])
+
+    if args.profile:
+        say("  Measuring local runtime latency …", "c")
+        say()
+        return subprocess.call([sys.executable, str(HERE / "tools" / "profile_runtime.py")])
 
     import uvicorn
 
